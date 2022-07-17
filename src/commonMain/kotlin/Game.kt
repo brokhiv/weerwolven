@@ -1,7 +1,4 @@
-import roles.ActionLimitReached
-import roles.PlayerProperty
-import roles.civiliansWolves
-import kotlin.io.readlnOrNull
+import roles.*
 
 /**
  * A Player of Weerwolven.
@@ -30,13 +27,16 @@ data class Player(val name: String, var role: Role = NullRole) {
     fun isAlive() = isAlive
 
     /**
-     * Sets isAlive to false because the Player dies.
+     * Sets isAlive to false because the Player dies, and may trigger onDeath events.
      */
     fun dies() {
+        println("$name was $role")
         isAlive = false
     }
 
     fun canAct(daypart: Game.Daypart, date: Int) = role.canAct(daypart, date) && ActionLimitReached !in properties
+
+    override fun toString() = "$name de $role"
 }
 
 /**
@@ -58,7 +58,7 @@ enum class Alignment {
 
 /**
  * Role that a Player can have.
- * @param actionPriority Determines the order in which this role acts at night, null if the Role does not act at night.
+ * @param actionPriority Determines the order in which this role acts at night, null if the Role does not act at night. A higher priority means that it can override an action with a lower priority.
  */
 abstract class Role(val actionPriority: Int? = null) {
     /**
@@ -83,15 +83,49 @@ abstract class Role(val actionPriority: Int? = null) {
 }
 
 /**
- * Default Role of every Player, will throw a NotImplementedError on any method.
+ * Default Role of every Player, should not exist once the game starts.
  */
 object NullRole: Role() {
-    override val alignment = throw NotImplementedError("Null Role")
-    override fun canAct(daypart: Game.Daypart, date: Int) = throw NotImplementedError("Null Role")
+    override val alignment = Alignment.NEUTRAL
+    override fun canAct(daypart: Game.Daypart, date: Int) = false
     override fun toString() = "Null Role"
 }
 
-class Game(val players: List<Player>, val mode: GameMode = GameMode.SEQUENTIAL) {
+/**
+ * Action of a Player
+ */
+abstract class Action(val type: ActionType) {
+    enum class ActionType {
+        BASIC_ATTACK;
+
+        companion object {
+            val attacks = listOf(BASIC_ATTACK)
+            val protections = listOf<ActionType>()
+        }
+    }
+
+    /**
+     * Player who carries out the Action.
+     */
+    abstract val performer: Player
+
+    /**
+     * Target(s) of the Action.
+     */
+    abstract val targets: List<Player>
+
+    /**
+     * Priority of the Action, higher priority may override a lower priority Action.
+     */
+    abstract val priority: Int
+
+    /**
+     * Whether this Action counts as a visit to the Target(s).
+     */
+    abstract val isVisit: Boolean
+}
+
+class Game(private val players: List<Player>, val mode: GameMode = GameMode.SEQUENTIAL) {
     /**
      * Ways that the Game can be played.
      * @instance SEQUENTIAL All actions are called one-by-one and fed back, anytime-roles are not possible.
@@ -105,8 +139,13 @@ class Game(val players: List<Player>, val mode: GameMode = GameMode.SEQUENTIAL) 
     /**
      * Mayor of Wakkerdam, is elected on Day 0.
      */
-    var mayor: Player = throw NullPointerException()
+    lateinit var mayor: Player
 
+    val winners = mutableListOf<Player>()
+
+    /**
+     * Can be either DAY or NIGHT.
+     */
     enum class Daypart {DAY, NIGHT}
 
 
@@ -135,7 +174,7 @@ class Game(val players: List<Player>, val mode: GameMode = GameMode.SEQUENTIAL) 
     fun isOver() = listOf(
         winCivilians(),
         winWolves(),
-    ).any()
+    ).any { it }
 
     // --- --- Begin Win Conditions --- --- \\
 
@@ -144,6 +183,26 @@ class Game(val players: List<Player>, val mode: GameMode = GameMode.SEQUENTIAL) 
     fun winWolves() = alivePlayers().all { it.role.alignment.isEvil() }
 
     // --- ---  End Win Conditions  --- --- \\
+
+    /**
+     * Returns the Player with the given name, or throws a NullPointerException if not found.
+     * @param name Name of the Player looked for.
+     * @throws NullPointerException if the given Player is not in the game
+     */
+    private fun findPlayer(name: String) = players.find { it.name == name }!!
+
+    /**
+     *  Selects a living Player based on the name typed in IO.
+     *  @param filter Optional, can filter players for eligibility.
+     */
+    fun selectPlayer(filter: (Player) -> Boolean = { true }): Player {
+        var name = readln()
+        while (name !in alivePlayers().filter(filter).map { it.name }) {
+            println(if (name !in alivePlayers().map { it.name }) "Player not found, please try again" else "This player cannot be picked now, please enter another")
+            name = readln()
+        }
+        return findPlayer(name)
+    }
 
     /**
      * Returns all Players that are alive.
@@ -155,24 +214,99 @@ class Game(val players: List<Player>, val mode: GameMode = GameMode.SEQUENTIAL) 
      */
     fun deadPlayers() = players.filterNot { it.isAlive() }
 
-    /**
-     * Runs the Game.
-     */
-    fun main() {
-        // Create players with only names and generate their role later
-        // FUTURE: add option to also specify role here
-        val players = buildList {
-            var line = readlnOrNull()
-            while (line != null) {
-                add(Player(line))
-                line = readlnOrNull()
+    companion object {
+        /**
+         * Runs the Game.
+         */
+        fun run() {
+            val game = run {
+                // Create players with only names and generate their role later
+                // FUTURE: add option to also specify role here
+                println("Wie wonen er in Wakkerdam?")
+
+                val players = buildList {
+                    var line = readln()
+                    while (line != "") {
+                        add(Player(line))
+                        line = readln()
+                    }
+                }
+
+                civiliansWolves(players.size).let { roles -> players.forEachIndexed { i, p -> p.role = roles[i] } }
+                Game(players)
             }
+
+            println("Wie wordt de burgemeester van Wakkerdam?")
+            game.mayor = game.selectPlayer().also { println("${it.name} is de burgemeester!") }
+
+            while (!game.isOver()) {
+                println("Heel Wakkerdam gaat slapen...")
+                game.advanceTime()
+
+                // -- Night section -- \\
+                val actions = mutableListOf<Action>()
+
+                if (game.alivePlayers().any { it.role is Werewolf }) {
+                    println("De weerwolven worden wakker. Wie kiezen ze als prooi?")
+                    val target = game.selectPlayer { it.role.alignment != Alignment.EVIL }
+
+                    actions.add(Werewolf.Attack(
+                        game.alivePlayers()
+                            .filter { it.role is Werewolf }
+                            .maxByOrNull { it.hashCode() }!!,
+                        listOf(target)
+                    ))
+                }
+
+                // Check who will die to an attack, minus who is successfully protected
+                val willDie = run {
+                    val attacked = actions
+                        .filter { it.type in Action.ActionType.attacks }
+                        .flatMap { a -> a.targets.map { t -> t to a.priority } }
+                    val protected = actions
+                        .filter { it.type in Action.ActionType.protections }
+                        .flatMap { a -> a.targets.map { t -> t to a.priority } }
+
+                    attacked
+                        .filter { (t, attack) -> protected.none { (t2, protection) -> t2 == t && protection >= attack } }
+                        .map { it.first }
+                }
+
+                if (willDie.isEmpty()) println("Heel Wakkerdam wordt wakker!")
+                else {
+                    willDie
+                        .also { println("Heel Wakkerdam wordt wakker... behalve: ${it.joinToString() { it.name }}") }
+                        .forEach { it.dies() }
+                }
+
+                if (game.isOver()) { break }
+
+                game.advanceTime()
+                // -- Day section -- \\
+
+                if (!game.mayor.isAlive()) {
+                    println("Wie wijst ${game.mayor.name} aan als opvolger?")
+                    game.mayor = game.selectPlayer().also { println("$it wordt de nieuwe burgemeester!") }
+                }
+
+                println("Wie wordt er vandaag op het vuur gegooid?")
+                game.selectPlayer().also { println("${it.name} wordt op het vuur gegooid!") }.dies()
+
+                if (!game.mayor.isAlive()) {
+                    println("Wie wijst ${game.mayor.name} aan als opvolger?")
+                    game.mayor = game.selectPlayer().also { println("$it wordt de nieuwe burgemeester!") }
+                }
+            }
+
+            // The game is over, who won?
+            if (game.winCivilians()) {
+                game.winners.addAll(game.players.filter { it.role.alignment == Alignment.GOOD })
+            }
+            if (game.winWolves()) {
+                game.winners.addAll(game.players.filter { it.role.alignment == Alignment.EVIL })
+            }
+
+            println("${game.winners.joinToString { it.name }} ${if (game.winners.size == 1) "wint" else "winnen" }!")
         }
-
-        civiliansWolves(players.size).let { roles -> players.forEachIndexed { i, p -> p.role = roles[i] } }
-
-        val game = Game(players)
-
-        game.players.forEach { println(it.toString()) }
     }
 }

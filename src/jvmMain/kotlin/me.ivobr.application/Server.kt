@@ -1,5 +1,6 @@
 package me.ivobr.application
 
+import Game
 import io.ktor.application.call
 import io.ktor.html.respondHtml
 import io.ktor.http.HttpStatusCode
@@ -27,6 +28,8 @@ fun HTML.index() {
 }
 
 fun main() {
+    Game.run()
+
     embeddedServer(Netty, port = 8080, host = "127.0.0.1") {
         routing {
             get("/") {
