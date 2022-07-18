@@ -19,7 +19,15 @@ data class Player(val name: String, var role: Role = NullRole) {
     /**
      * Keeps the state of a Player.
      */
-    val properties = mutableListOf<PlayerProperty>()
+    private val currentProperties = mutableListOf<PlayerProperty>()
+
+    fun addProperty(property: PlayerProperty) {
+        currentProperties.add(property)
+    }
+
+    fun removeProperty(property: PlayerProperty) {
+        currentProperties.remove(property)
+    }
 
     /**
      * Returns true if the Player is alive.
@@ -29,12 +37,34 @@ data class Player(val name: String, var role: Role = NullRole) {
     /**
      * Sets isAlive to false because the Player dies, and may trigger onDeath events.
      */
-    fun dies() {
-        println("$name was $role")
+    fun dies(cause: DeathCause) {
+
+        when (cause) {
+            DeathCause.NATURAL_DEATH -> {
+                // No onDeath events can trigger with a Natural Death
+                println("$name is plotseling doodgegaan.")
+                println("$name was $role.")
+                isAlive = false
+                return
+            }
+            DeathCause.LYNCHED -> {
+                println("$name wordt op het vuur gegooid!")
+            }
+            DeathCause.WEREWOLF_ATTACK -> {
+            }
+            DeathCause.LOVER_DIED -> {}
+        }
+
+        role.onDeath(cause)
+
+        // Kill lover if present
+        (currentProperties.firstOrNull { it is InLoveWith } as InLoveWith?)?.lover?.dies(DeathCause.LOVER_DIED)
+
+        println("$name was $role.")
         isAlive = false
     }
 
-    fun canAct(daypart: Game.Daypart, date: Int) = role.canAct(daypart, date) && ActionLimitReached !in properties
+    fun canAct(daypart: Game.Daypart, date: Int) = role.canAct(daypart, date, currentProperties)
 
     override fun toString() = "$name de $role"
 }
@@ -56,6 +86,13 @@ enum class Alignment {
     fun isEvil() = this == EVIL || this == NEUTRAL
 }
 
+enum class DeathCause {
+    NATURAL_DEATH, // Player is killed by the Game Leader, no onDeath events are triggered
+    LYNCHED, // Player is voted to be lynched
+    WEREWOLF_ATTACK, // Player is eaten by the Werewolves
+    LOVER_DIED;
+}
+
 /**
  * Role that a Player can have.
  * @param actionPriority Determines the order in which this role acts at night, null if the Role does not act at night. A higher priority means that it can override an action with a lower priority.
@@ -66,20 +103,17 @@ abstract class Role(val actionPriority: Int? = null) {
      */
     abstract val alignment: Alignment
 
+    open val properties: List<PlayerProperty> = emptyList()
+
     /**
      * Returns true if the Player can perform their action at the current time in their current state.
      */
-    abstract fun canAct(daypart: Game.Daypart, date: Int): Boolean
+    abstract fun canAct(daypart: Game.Daypart, date: Int, currentProperties: MutableList<PlayerProperty>): Boolean
 
     /**
      * Can be called when the Player is successfully eaten by the werewolves.
      */
-    fun whenEaten() {}
-
-    /**
-     * Can be called when the Player is lynched by the town.
-     */
-    fun whenLynched() {}
+    open fun onDeath(cause: DeathCause) {}
 }
 
 /**
@@ -87,7 +121,7 @@ abstract class Role(val actionPriority: Int? = null) {
  */
 object NullRole: Role() {
     override val alignment = Alignment.NEUTRAL
-    override fun canAct(daypart: Game.Daypart, date: Int) = false
+    override fun canAct(daypart: Game.Daypart, date: Int, currentProperties: MutableList<PlayerProperty>) = false
     override fun toString() = "Null Role"
 }
 
@@ -95,8 +129,10 @@ object NullRole: Role() {
  * Action of a Player
  */
 abstract class Action(val type: ActionType) {
-    enum class ActionType {
-        BASIC_ATTACK;
+    enum class ActionType(val isVisit: Boolean) {
+        BASIC_ATTACK(true),
+        BASIC_PROTECTION(true),
+        VISIT(true);
 
         companion object {
             val attacks = listOf(BASIC_ATTACK)
@@ -119,10 +155,9 @@ abstract class Action(val type: ActionType) {
      */
     abstract val priority: Int
 
-    /**
-     * Whether this Action counts as a visit to the Target(s).
-     */
-    abstract val isVisit: Boolean
+    abstract fun execute(game: Game)
+
+    abstract fun transform(performer: Player = this.performer, targets: List<Player> = this.targets): Action
 }
 
 class Game(private val players: List<Player>, val mode: GameMode = GameMode.SEQUENTIAL) {
@@ -258,25 +293,44 @@ class Game(private val players: List<Player>, val mode: GameMode = GameMode.SEQU
                     ))
                 }
 
-                // Check who will die to an attack, minus who is successfully protected
-                val willDie = run {
-                    val attacked = actions
-                        .filter { it.type in Action.ActionType.attacks }
-                        .flatMap { a -> a.targets.map { t -> t to a.priority } }
+                // Check who is protected, and scrap all attacks with lower priority
+                run {
                     val protected = actions
                         .filter { it.type in Action.ActionType.protections }
                         .flatMap { a -> a.targets.map { t -> t to a.priority } }
 
-                    attacked
-                        .filter { (t, attack) -> protected.none { (t2, protection) -> t2 == t && protection >= attack } }
-                        .map { it.first }
+                    actions
+                        .map {a ->
+                            if (a.type in Action.ActionType.attacks
+                                && a.targets.intersect(protected.map { it.first }.toSet()).isNotEmpty()
+                            ) {
+                                // NOTE This may create attacks targeted at nobody
+                                a.transform(targets = a.targets.filter { t ->
+                                    (protected.firstOrNull { it.first == t }?.second ?: 0) > a.priority
+                                })
+                            }
+                        }
                 }
+
+                // Check who will die to an attack, minus who is successfully protected
+                val willDie = actions
+                    .filter { it.type in Action.ActionType.attacks }
+                    .flatMap { a -> a.targets }
 
                 if (willDie.isEmpty()) println("Heel Wakkerdam wordt wakker!")
                 else {
+                    // TODO swap for executing all remaining attacks
                     willDie
                         .also { println("Heel Wakkerdam wordt wakker... behalve: ${it.joinToString() { it.name }}") }
-                        .forEach { it.dies() }
+                        .forEach { p -> p.dies(
+                            when (actions
+                                .filter { p in it.targets && it.type in Action.ActionType.attacks }
+                                .maxByOrNull { it.priority }
+                            ) {
+                                is Werewolf.Attack -> DeathCause.WEREWOLF_ATTACK
+                                else -> error("Unknown Attack Type")
+                            }
+                        ) }
                 }
 
                 if (game.isOver()) { break }
@@ -290,7 +344,7 @@ class Game(private val players: List<Player>, val mode: GameMode = GameMode.SEQU
                 }
 
                 println("Wie wordt er vandaag op het vuur gegooid?")
-                game.selectPlayer().also { println("${it.name} wordt op het vuur gegooid!") }.dies()
+                game.selectPlayer().dies(DeathCause.LYNCHED)
 
                 if (!game.mayor.isAlive()) {
                     println("Wie wijst ${game.mayor.name} aan als opvolger?")
